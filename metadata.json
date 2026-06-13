@@ -1,0 +1,6 @@
+{
+  "name": "Concentric",
+  "description": "An advanced concentric-ring workout timer with multi-knob custom sliders, customizable set preferences, and programmatic audio feedback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
