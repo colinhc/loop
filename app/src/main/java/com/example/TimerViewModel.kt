@@ -32,7 +32,9 @@ data class TimerUiState(
     val universalEndSound: String = SoundManager.SOUND_BEEP_HIGH,
     val workouts: List<Workout> = emptyList(),
     val activeWorkoutId: Int? = null,
-    val activeWorkoutName: String? = null
+    val activeWorkoutName: String? = null,
+    val backupRestoreMessage: String? = null,
+    val isWorkoutActive: Boolean = false
 )
 
 class TimerViewModel(application: Application) : AndroidViewModel(application) {
@@ -220,7 +222,8 @@ class TimerViewModel(application: Application) : AndroidViewModel(application) {
                 elapsedSeconds = 0f,
                 setPreferencesList = fullList,
                 activeWorkoutId = workout.id,
-                activeWorkoutName = workout.name
+                activeWorkoutName = workout.name,
+                isWorkoutActive = false
             )
         }
         val sharedPrefs = getApplication<Application>().getSharedPreferences("loop_prefs", Context.MODE_PRIVATE)
@@ -324,6 +327,73 @@ class TimerViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun clearBackupMessage() {
+        _uiState.update { it.copy(backupRestoreMessage = null) }
+    }
+
+    fun backupWorkoutPlansToInternalStorage(): String {
+        val json = WorkoutBackupManager.createBackupJson(_uiState.value.workouts)
+        WorkoutBackupManager.saveBackupToInternalStorage(getApplication(), json)
+        val count = _uiState.value.workouts.size
+        _uiState.update {
+            it.copy(backupRestoreMessage = "Backed up $count workout plan(s) to internal storage")
+        }
+        return json
+    }
+
+    fun exportWorkoutPlansToUri(androidUri: android.net.Uri) {
+        viewModelScope.launch {
+            val json = WorkoutBackupManager.createBackupJson(_uiState.value.workouts)
+            val success = WorkoutBackupManager.exportToUri(getApplication(), androidUri, json)
+            val msg = if (success) "Exported ${_uiState.value.workouts.size} workout plan(s) to file" else "Failed to export workout plans"
+            _uiState.update { it.copy(backupRestoreMessage = msg) }
+        }
+    }
+
+    fun restoreWorkoutPlansFromInternalStorage(): Int {
+        val file = WorkoutBackupManager.getInternalStorageBackupFile(getApplication())
+        if (file == null || !file.exists()) {
+            _uiState.update { it.copy(backupRestoreMessage = "No internal storage backup file found") }
+            return 0
+        }
+        val json = file.readText()
+        return restoreWorkoutPlansFromJson(json)
+    }
+
+    fun restoreWorkoutPlansFromUri(androidUri: android.net.Uri) {
+        viewModelScope.launch {
+            val json = WorkoutBackupManager.readJsonFromUri(getApplication(), androidUri)
+            if (json.isNullOrBlank()) {
+                _uiState.update { it.copy(backupRestoreMessage = "Failed to read JSON backup file") }
+            } else {
+                restoreWorkoutPlansFromJson(json)
+            }
+        }
+    }
+
+    fun restoreWorkoutPlansFromJson(jsonString: String): Int {
+        val restoredWorkouts = WorkoutBackupManager.parseBackupJson(jsonString)
+        if (restoredWorkouts.isEmpty()) {
+            _uiState.update { it.copy(backupRestoreMessage = "No valid workout plans found in JSON") }
+            return 0
+        }
+        viewModelScope.launch {
+            restoredWorkouts.forEach { workout ->
+                repository.insert(workout)
+            }
+            _uiState.update {
+                it.copy(
+                    backupRestoreMessage = "Successfully restored ${restoredWorkouts.size} workout plan(s)!"
+                )
+            }
+            // Automatically load first restored workout if none currently active
+            if (_uiState.value.activeWorkoutId == null && restoredWorkouts.isNotEmpty()) {
+                loadWorkout(restoredWorkouts.first())
+            }
+        }
+        return restoredWorkouts.size
+    }
+
     fun toggleStartPause() {
         if (_uiState.value.isRunning) {
             pauseTimer()
@@ -334,7 +404,7 @@ class TimerViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun startTimer() {
         if (_uiState.value.totalSets == 0) return
-        _uiState.update { it.copy(isRunning = true) }
+        _uiState.update { it.copy(isRunning = true, isWorkoutActive = true) }
         
         try {
             getWakeLock().acquire(1 * 3600 * 1000L) // 1-hour safe timeout to protect battery
@@ -390,7 +460,8 @@ class TimerViewModel(application: Application) : AndroidViewModel(application) {
                             it.copy(
                                 isRunning = false,
                                 activeSetIndex = 1,
-                                elapsedSeconds = 0f
+                                elapsedSeconds = 0f,
+                                isWorkoutActive = false
                             )
                         }
                         timerJob?.cancel()
@@ -426,7 +497,8 @@ class TimerViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 activeSetIndex = if (it.totalSets > 0) 1 else 0,
-                elapsedSeconds = 0f
+                elapsedSeconds = 0f,
+                isWorkoutActive = false
             )
         }
         viewModelScope.launch {

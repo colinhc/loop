@@ -1,8 +1,13 @@
 package com.example
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.LinearOutSlowInEasing
@@ -10,6 +15,10 @@ import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -24,17 +33,32 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Upload
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Storage
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.window.DialogProperties
+import android.widget.Toast
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -105,12 +129,39 @@ val ringColors = listOf(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun WorkoutTimerApp(
-    viewModel: TimerViewModel = viewModel()
+    viewModel: TimerViewModel = viewModel(),
+    enablePulseAnimation: Boolean = true
 ) {
     val state by viewModel.uiState.collectAsState()
     val density = LocalDensity.current
     val scrollState = rememberScrollState()
     var showSettings by remember { mutableStateOf(false) }
+
+    val context = LocalContext.current
+
+    val restoreFileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.restoreWorkoutPlansFromUri(uri)
+        }
+    }
+
+    val exportFileLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri != null) {
+            viewModel.exportWorkoutPlansToUri(uri)
+        }
+    }
+
+    LaunchedEffect(state.backupRestoreMessage) {
+        val msg = state.backupRestoreMessage
+        if (!msg.isNullOrBlank()) {
+            Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            viewModel.clearBackupMessage()
+        }
+    }
 
     // Dynamic states to track the clock dial center & radius relative to root coordinates
     var clockFaceCenterInRoot by remember { mutableStateOf<Offset?>(null) }
@@ -133,6 +184,13 @@ fun WorkoutTimerApp(
                 },
             contentScale = ContentScale.Crop,
             alpha = 0.30f // High-visibility base alpha, shown fully inside the cutout lens!
+        )
+
+        // Dynamic animated alpha for blackout mask outside clock cutout (1.0f = pure black when active)
+        val maskAlpha by animateFloatAsState(
+            targetValue = if (state.isWorkoutActive) 1.0f else 0.82f,
+            animationSpec = tween(durationMillis = 400),
+            label = "mask_alpha"
         )
 
         // Draw the dark overlay mask with a dynamic circular hole punched out for the clock face
@@ -165,11 +223,11 @@ fun WorkoutTimerApp(
             } else {
                 rectPath
             }
-            
-            // Mask 0xFF0A0A0A drawn over background with 0.82f alpha, leaving ~5.4% subtle image visibility outside the cutout
+
+            // Mask 0xFF0A0A0A drawn over background; becomes 100% solid black when workout is active
             drawPath(
                 path = maskPath,
-                color = Color(0xFF0A0A0A).copy(alpha = 0.82f)
+                color = Color(0xFF0A0A0A).copy(alpha = maskAlpha)
             )
         }
 
@@ -178,14 +236,11 @@ fun WorkoutTimerApp(
             containerColor = Color.Transparent // Allow background artwork to shine through seamlessly
         ) { innerPadding ->
             Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(scrollState),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(20.dp)
-        ) {
-            // Immersive Header (HypeSet Pro branding styling)
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
+                // Immersive Header (HypeSet Pro branding styling) - Always visible at top
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -248,13 +303,60 @@ fun WorkoutTimerApp(
                 }
             }
 
-            // Workout List / Management Section moved to the top
-            Column(
+            // Main body area below persistent header
+            BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 24.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                    .weight(1f)
             ) {
+                val totalAvailableHeight = maxHeight
+                val clockBoxWidth = maxWidth * 0.9f
+                val clockBoxHeight = clockBoxWidth + 24.dp
+
+                // Clock animated zoom scale (zooms in when timer starts or is paused)
+                val clockScale by animateFloatAsState(
+                    targetValue = if (state.isWorkoutActive) 1.20f else 1.0f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioLowBouncy,
+                        stiffness = Spring.StiffnessLow
+                    ),
+                    label = "clock_scale"
+                )
+
+                // Centering offset when upper and lower portions are hidden
+                val centeredTopSpacer = ((totalAvailableHeight - clockBoxHeight) / 2).coerceAtLeast(0.dp)
+                val animatedTopSpacer by animateDpAsState(
+                    targetValue = if (state.isWorkoutActive) centeredTopSpacer else 0.dp,
+                    animationSpec = tween(durationMillis = 450, easing = FastOutSlowInEasing),
+                    label = "clock_center_spacer"
+                )
+
+                LaunchedEffect(state.isWorkoutActive) {
+                    if (state.isWorkoutActive) {
+                        scrollState.animateScrollTo(0)
+                    }
+                }
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(scrollState, enabled = !state.isWorkoutActive),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    // UPPER PORTION: Workout Plans Section (Hidden when timer starts or is paused)
+                    AnimatedVisibility(
+                        visible = !state.isWorkoutActive,
+                        enter = fadeIn(animationSpec = tween(350, easing = FastOutSlowInEasing)) +
+                                expandVertically(animationSpec = tween(400, easing = FastOutSlowInEasing)),
+                        exit = fadeOut(animationSpec = tween(300, easing = FastOutSlowInEasing)) +
+                               shrinkVertically(animationSpec = tween(350, easing = FastOutSlowInEasing))
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(16.dp)
+                        ) {
                 var showSaveDialog by remember { mutableStateOf(false) }
 
                 var draggedIndex by remember { mutableStateOf<Int?>(null) }
@@ -323,29 +425,35 @@ fun WorkoutTimerApp(
                         )
                     }
                     
-                    Button(
-                        onClick = { showSaveDialog = true },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Color(0xFFDC2626),
-                            contentColor = Color.White
-                        ),
-                        shape = RoundedCornerShape(12.dp),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                        modifier = Modifier
-                            .height(36.dp)
-                            .testTag("save_workout_button")
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.Add,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "CREATE NEW",
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        // Create New Button
+                        Button(
+                            onClick = { showSaveDialog = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Color(0xFFDC2626),
+                                contentColor = Color.White
+                            ),
+                            shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                            modifier = Modifier
+                                .height(34.dp)
+                                .testTag("save_workout_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Add,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "NEW",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
                     }
                 }
 
@@ -533,130 +641,95 @@ fun WorkoutTimerApp(
                 }
 
                 if (showSaveDialog) {
-                    var workoutName by remember { mutableStateOf("") }
-
-                    AlertDialog(
-                        onDismissRequest = { showSaveDialog = false },
-                        title = {
-                            Text(
-                                text = "CREATE NEW PLAN",
-                                style = MaterialTheme.typography.titleMedium.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White,
-                                    letterSpacing = 1.sp
-                                )
-                            )
-                        },
-                        text = {
-                            Column(
-                                verticalArrangement = Arrangement.spacedBy(16.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(
-                                    text = "Please enter a name for this custom workout plan:",
-                                    style = MaterialTheme.typography.bodyMedium.copy(
-                                        color = Color(0xFFE2E2E6)
-                                    )
-                                )
-                                OutlinedTextField(
-                                    value = workoutName,
-                                    onValueChange = { workoutName = it },
-                                    placeholder = { Text("e.g. HIIT Power Rounds") },
-                                    singleLine = true,
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = Color(0xFFDC2626),
-                                        unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
-                                        focusedLabelColor = Color(0xFFDC2626),
-                                        focusedTextColor = Color.White,
-                                        unfocusedTextColor = Color.White,
-                                        focusedPlaceholderColor = Color(0xFF88888D),
-                                        unfocusedPlaceholderColor = Color(0xFF88888D)
-                                    ),
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .testTag("workout_name_input")
-                                )
-                            }
-                        },
-                        confirmButton = {
-                            Button(
-                                onClick = {
-                                    if (workoutName.trim().isNotEmpty()) {
-                                        viewModel.saveWorkout(workoutName.trim())
-                                        showSaveDialog = false
-                                    }
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color(0xFFDC2626),
-                                    contentColor = Color.White
-                                )
-                            ) {
-                                Text("SAVE")
-                            }
-                        },
-                        dismissButton = {
-                            TextButton(
-                                onClick = { showSaveDialog = false }
-                            ) {
-                                Text(
-                                    text = "CANCEL",
-                                    color = Color(0xFF88888F)
-                                )
-                            }
-                        },
-                        containerColor = Color(0xFF141414),
-                        shape = RoundedCornerShape(24.dp)
+                    SavePlanDialog(
+                        onDismiss = { showSaveDialog = false },
+                        onSave = { name ->
+                            viewModel.saveWorkout(name)
+                            showSaveDialog = false
+                        }
                     )
                 }
-            }
+                        }
+                    }
 
-            Spacer(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(2.dp)
-                    .background(Color.White.copy(alpha = 0.05f))
-            )
+                    // Divider line below Workout Plans (Hidden when timer starts or is paused)
+                    AnimatedVisibility(
+                        visible = !state.isWorkoutActive,
+                        enter = fadeIn(animationSpec = tween(350, easing = FastOutSlowInEasing)) +
+                                expandVertically(animationSpec = tween(400, easing = FastOutSlowInEasing)),
+                        exit = fadeOut(animationSpec = tween(300, easing = FastOutSlowInEasing)) +
+                               shrinkVertically(animationSpec = tween(350, easing = FastOutSlowInEasing))
+                    ) {
+                        Spacer(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 8.dp)
+                                .height(2.dp)
+                                .background(Color.White.copy(alpha = 0.05f))
+                        )
+                    }
 
-            // Occupies 70% of screen width in a constrained square box
-            BoxWithConstraints(
-                modifier = Modifier
-                    .fillMaxWidth(0.9f)
-                    .aspectRatio(1f)
-                    .padding(vertical = 12.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                val boxWidth = maxWidth
-                val boxWidthPx = with(LocalDensity.current) { boxWidth.toPx() }
-                
-                // Clock Dial component in center
-                ClockDial(
-                    modifier = Modifier.fillMaxSize(),
-                    totalSets = state.totalSets,
-                    activeSetIndex = state.activeSetIndex,
-                    elapsedSeconds = state.elapsedSeconds,
-                    preferencesList = state.setPreferencesList,
-                    boxWidthPx = boxWidthPx,
-                    isRunning = state.isRunning,
-                    onTogglePlay = { viewModel.toggleStartPause() },
-                    onReset = { viewModel.resetTimer() },
-                    onGlobalsChanged = { center, radius ->
-                        clockFaceCenterInRoot = center
-                        clockFaceRadiusInRoot = radius
-                    },
-                    selectedSet = state.selectedSet
-                )
-            }
+                    // Dynamic centering spacer when upper/lower sections hide
+                    if (animatedTopSpacer > 0.dp) {
+                        Spacer(modifier = Modifier.height(animatedTopSpacer))
+                    }
 
-            // Immersive Control Section Panel styled like a sheets-up card base
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(topStart = 40.dp, topEnd = 40.dp))
-                    .background(Color(0xFF141414))
-                    .shadow(elevation = 24.dp)
-                    .padding(horizontal = 24.dp, vertical = 42.dp),
-                verticalArrangement = Arrangement.spacedBy(42.dp)
-            ) {
+                    // MIDDLE PORTION: Clock Dial in center (Zooms in when timer starts)
+                    BoxWithConstraints(
+                        modifier = Modifier
+                            .fillMaxWidth(0.9f)
+                            .aspectRatio(1f)
+                            .padding(vertical = 12.dp)
+                            .testTag("clock_dial_container")
+                            .graphicsLayer {
+                                scaleX = clockScale
+                                scaleY = clockScale
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val boxWidth = maxWidth
+                        val boxWidthPx = with(LocalDensity.current) { boxWidth.toPx() }
+                        
+                        // Clock Dial component in center
+                        ClockDial(
+                            modifier = Modifier.fillMaxSize(),
+                            totalSets = state.totalSets,
+                            activeSetIndex = state.activeSetIndex,
+                            elapsedSeconds = state.elapsedSeconds,
+                            preferencesList = state.setPreferencesList,
+                            boxWidthPx = boxWidthPx,
+                            isRunning = state.isRunning,
+                            onTogglePlay = { viewModel.toggleStartPause() },
+                            onReset = { viewModel.resetTimer() },
+                            onGlobalsChanged = { center, radius ->
+                                clockFaceCenterInRoot = center
+                                clockFaceRadiusInRoot = radius
+                            },
+                            selectedSet = state.selectedSet,
+                            clockScale = clockScale,
+                            isWorkoutActiveOverride = state.isWorkoutActive,
+                            enablePulseAnimation = enablePulseAnimation
+                        )
+                    }
+
+                    // LOWER PORTION: Control Section Panel (Hidden when timer starts or is paused)
+                    AnimatedVisibility(
+                        visible = !state.isWorkoutActive,
+                        enter = fadeIn(animationSpec = tween(350, easing = FastOutSlowInEasing)) +
+                                expandVertically(animationSpec = tween(400, easing = FastOutSlowInEasing)),
+                        exit = fadeOut(animationSpec = tween(300, easing = FastOutSlowInEasing)) +
+                               shrinkVertically(animationSpec = tween(350, easing = FastOutSlowInEasing))
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 16.dp)
+                                .clip(RoundedCornerShape(topStart = 40.dp, topEnd = 40.dp))
+                                .background(Color(0xFF141414))
+                                .shadow(elevation = 24.dp)
+                                .padding(horizontal = 24.dp, vertical = 42.dp),
+                            verticalArrangement = Arrangement.spacedBy(42.dp)
+                        ) {
                 // First Slider Section: Sets Controller & Selector
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     Row(
@@ -775,15 +848,21 @@ fun WorkoutTimerApp(
                             textAlign = TextAlign.Center,
                             style = MaterialTheme.typography.bodyLarge.copy(fontSize = 15.sp)
                         )
+                        }
                     }
                 }
             }
         }
     }
+}
+        }
 
     if (showSettings) {
         AlertDialog(
             onDismissRequest = { showSettings = false },
+            properties = DialogProperties(
+                decorFitsSystemWindows = false
+            ),
             title = {
                 Text(
                     text = "SOUND SETTINGS",
@@ -831,7 +910,7 @@ fun WorkoutTimerApp(
                                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                                     ) {
                                         Icon(
-                                            imageVector = Icons.Default.VolumeUp,
+                                            imageVector = Icons.AutoMirrored.Filled.VolumeUp,
                                             contentDescription = null,
                                             tint = if (isSelected) Color.Black else Color(0xFFEAB308),
                                             modifier = Modifier.size(16.dp)
@@ -897,7 +976,94 @@ fun WorkoutTimerApp(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(Color.White.copy(alpha = 0.1f))
+                    )
+
+                    // Data Backup & Restore Buttons Section at bottom of settings page
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            text = "Backup & Restore Plans",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFFE2E2E6)
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            // Backup Button (Exports JSON & saves to internal storage)
+                            OutlinedButton(
+                                onClick = {
+                                    viewModel.backupWorkoutPlansToInternalStorage()
+                                    try {
+                                        exportFileLauncher.launch("workout_plans_backup.json")
+                                    } catch (e: Exception) {
+                                        e.printStackTrace()
+                                    }
+                                },
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = Color(0xFFE2E2E6)
+                                ),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp)
+                                    .testTag("backup_workouts_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Download,
+                                    contentDescription = "Backup JSON",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "BACKUP",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            // Restore Button (Launches JSON file picker)
+                            OutlinedButton(
+                                onClick = {
+                                    try {
+                                        restoreFileLauncher.launch("*/*")
+                                    } catch (e: Exception) {
+                                        viewModel.restoreWorkoutPlansFromInternalStorage()
+                                    }
+                                },
+                                colors = ButtonDefaults.outlinedButtonColors(
+                                    contentColor = Color(0xFFE2E2E6)
+                                ),
+                                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.2f)),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(40.dp)
+                                    .testTag("restore_workouts_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Upload,
+                                    contentDescription = "Restore JSON",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "RESTORE",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
                         text = "@2026 Colin C",
                         style = MaterialTheme.typography.bodySmall.copy(
@@ -941,25 +1107,32 @@ fun ClockDial(
     onTogglePlay: () -> Unit,
     onReset: () -> Unit,
     onGlobalsChanged: (center: Offset, radius: Float) -> Unit = { _, _ -> },
-    selectedSet: Int = 1
+    selectedSet: Int = 1,
+    clockScale: Float = 1.0f,
+    isWorkoutActiveOverride: Boolean = false,
+    enablePulseAnimation: Boolean = true
 ) {
     val density = LocalDensity.current
     val strokeWidthRing = with(density) { 6.dp.toPx() }
     
     // Check if the actual active workout phase is running or has progress
-    val isWorkoutActive = isRunning || elapsedSeconds > 0f || activeSetIndex > 1
+    val isWorkoutActive = isWorkoutActiveOverride || isRunning || elapsedSeconds > 0f || activeSetIndex > 1
 
-    // Infinite breathing/glowing animation for selected ring track/fill
-    val infiniteTransition = rememberInfiniteTransition(label = "ring_glowing")
-    val pulseAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 0.85f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1000, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "pulse_alpha"
-    )
+    // Breathing/glowing animation for selected ring track/fill
+    val isInspection = LocalInspectionMode.current
+    val pulseAlpha = if (isInspection || !enablePulseAnimation) 0.65f else {
+        val infiniteTransition = rememberInfiniteTransition(label = "ring_glowing")
+        val anim by infiniteTransition.animateFloat(
+            initialValue = 0.25f,
+            targetValue = 0.85f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 1000, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse
+            ),
+            label = "pulse_alpha"
+        )
+        anim
+    }
 
     // Flash animation triggered when active selected set custom duration or countdown counts are modified
     val selectedSetPref = if (selectedSet in preferencesList.indices) preferencesList[selectedSet] else null
@@ -1185,7 +1358,7 @@ fun ClockDial(
                         x = pos.x + coordinates.size.width / 2f,
                         y = pos.y + coordinates.size.height / 2f
                     )
-                    val radius = coordinates.size.width / 2f
+                    val radius = (coordinates.size.width / 2f) * clockScale
                     onGlobalsChanged(center, radius)
                 }
                 .shadow(elevation = 16.dp, shape = CircleShape),
@@ -1801,4 +1974,117 @@ fun TripleKnobDurationSlider(
             }
         }
     }
+}
+
+@Composable
+fun SavePlanDialogContent(
+    workoutName: String,
+    onWorkoutNameChange: (String) -> Unit,
+    onSave: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+        modifier = modifier.fillMaxWidth()
+    ) {
+        Text(
+            text = "Please enter a name for this custom workout plan:",
+            style = MaterialTheme.typography.bodyMedium.copy(
+                color = Color(0xFFE2E2E6)
+            )
+        )
+        OutlinedTextField(
+            value = workoutName,
+            onValueChange = onWorkoutNameChange,
+            placeholder = { Text("e.g. HIIT Power Rounds") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(
+                capitalization = KeyboardCapitalization.Words,
+                imeAction = ImeAction.Done
+            ),
+            keyboardActions = KeyboardActions(
+                onDone = { onSave() }
+            ),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = Color(0xFFDC2626),
+                unfocusedBorderColor = Color.White.copy(alpha = 0.2f),
+                focusedLabelColor = Color(0xFFDC2626),
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                focusedPlaceholderColor = Color(0xFF88888D),
+                unfocusedPlaceholderColor = Color(0xFF88888D)
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("workout_name_input")
+        )
+    }
+}
+
+@Composable
+fun SavePlanDialog(
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit
+) {
+    var workoutName by remember { mutableStateOf("") }
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    val dismissDialog = {
+        keyboardController?.hide()
+        onDismiss()
+    }
+
+    val submitDialog = {
+        val trimmed = workoutName.trim()
+        if (trimmed.isNotEmpty()) {
+            keyboardController?.hide()
+            onSave(trimmed)
+        }
+    }
+
+    AlertDialog(
+        onDismissRequest = dismissDialog,
+        title = {
+            Text(
+                text = "CREATE NEW PLAN",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    letterSpacing = 1.sp
+                )
+            )
+        },
+        text = {
+            SavePlanDialogContent(
+                workoutName = workoutName,
+                onWorkoutNameChange = { workoutName = it },
+                onSave = submitDialog
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = submitDialog,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = Color(0xFFDC2626),
+                    contentColor = Color.White
+                ),
+                modifier = Modifier.testTag("save_plan_confirm_button")
+            ) {
+                Text("SAVE")
+            }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = dismissDialog,
+                modifier = Modifier.testTag("save_plan_cancel_button")
+            ) {
+                Text(
+                    text = "CANCEL",
+                    color = Color(0xFF88888F)
+                )
+            }
+        },
+        containerColor = Color(0xFF141414),
+        shape = RoundedCornerShape(24.dp)
+    )
 }

@@ -51,13 +51,13 @@ class DoubleKnobSetsSliderTest {
 
         // Drag overlapping knobs from tick 3 to the right (tick 4 or 5)
         composeTestRule.onNodeWithTag("sets_double_slider").performTouchInput {
-            // center of the slider corresponds to tick 3 out of 1..5
             val startX = width / 2f
             val startY = height / 2f
 
             down(Offset(startX, startY))
-            // Drag to the right
-            moveTo(Offset(startX + width / 4f, startY))
+            // Send incremental drag steps so detectDragGestures triggers onDragStart and onDrag
+            moveBy(Offset(20f, 0f))
+            moveBy(Offset(80f, 0f))
             up()
         }
 
@@ -95,8 +95,8 @@ class DoubleKnobSetsSliderTest {
             val startY = height / 2f
 
             down(Offset(startX, startY))
-            // Drag to the left
-            moveTo(Offset(startX - width / 4f, startY))
+            moveBy(Offset(-20f, 0f))
+            moveBy(Offset(-80f, 0f))
             up()
         }
 
